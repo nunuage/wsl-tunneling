@@ -23,9 +23,9 @@ func TestTrayMenuBounds(t *testing.T) {
 		pt   win.POINT
 		want win.RECT
 	}{
-		{"bottom right", win.RECT{Right: 1920, Bottom: 1040}, win.POINT{X: 1900, Y: 1060}, win.RECT{Left: 1556, Top: 708, Right: 1900, Bottom: 1040}},
-		{"top left taskbar", win.RECT{Left: 60, Top: 40, Right: 1920, Bottom: 1080}, win.POINT{X: 20, Y: 20}, win.RECT{Left: 60, Top: 40, Right: 404, Bottom: 372}},
-		{"negative monitor", win.RECT{Left: -1920, Top: -1080, Right: 0, Bottom: -40}, win.POINT{X: -10, Y: -20}, win.RECT{Left: -354, Top: -372, Right: -10, Bottom: -40}},
+		{"bottom right", win.RECT{Right: 1920, Bottom: 1040}, win.POINT{X: 1900, Y: 1060}, win.RECT{Left: 1556, Top: 732, Right: 1900, Bottom: 1040}},
+		{"top left taskbar", win.RECT{Left: 60, Top: 40, Right: 1920, Bottom: 1080}, win.POINT{X: 20, Y: 20}, win.RECT{Left: 60, Top: 40, Right: 404, Bottom: 348}},
+		{"negative monitor", win.RECT{Left: -1920, Top: -1080, Right: 0, Bottom: -40}, win.POINT{X: -10, Y: -20}, win.RECT{Left: -354, Top: -348, Right: -10, Bottom: -40}},
 		{"small", win.RECT{Left: 10, Top: 20, Right: 110, Bottom: 100}, win.POINT{X: 500, Y: 500}, win.RECT{Left: 10, Top: 20, Right: 110, Bottom: 100}},
 		{"one pixel", win.RECT{Left: -1, Top: -1}, win.POINT{}, win.RECT{Left: -1, Top: -1}},
 		{"empty", win.RECT{}, win.POINT{}, win.RECT{}},
@@ -47,7 +47,7 @@ func TestTrayMenuLayoutAndHit(t *testing.T) {
 	s := (&app{startEnabled: true, configEnabled: true, bootEnabled: true}).menuSnapshot()
 	for _, size := range [][2]int32{{menuWidth, menuHeight}, {200, 100}, {1, 1}, {0, 0}, {-10, -20}} {
 		l := menuLayout(size[0], size[1])
-		rects := append([]win.RECT{l.brand, l.title, l.status, l.badge}, l.rows[:]...)
+		rects := append([]win.RECT{l.brand, l.title, l.badge}, l.rows[:]...)
 		for _, r := range rects {
 			if r.Left < 0 || r.Top < 0 || r.Right > max(0, size[0]) || r.Bottom > max(0, size[1]) || r.Right < r.Left || r.Bottom < r.Top {
 				t.Fatalf("invalid layout for %v: %+v", size, r)
@@ -60,7 +60,7 @@ func TestTrayMenuLayoutAndHit(t *testing.T) {
 		}
 	}
 	l := menuLayout(menuWidth, menuHeight)
-	if l.rows[0].Top != 104 || l.rows[4].Bottom != 320 || l.status.Bottom > l.rows[0].Top || l.brand.Right > l.badge.Left {
+	if l.rows[0].Top != 80 || l.rows[4].Bottom != 296 || l.title.Bottom > l.rows[0].Top || l.brand.Right > l.badge.Left {
 		t.Fatalf("unexpected full-size layout: %+v", l)
 	}
 	for i, row := range l.rows {
@@ -75,7 +75,7 @@ func TestTrayMenuLayoutAndHit(t *testing.T) {
 			t.Fatal("right boundary must be exclusive")
 		}
 	}
-	for _, pt := range []win.POINT{{X: -1, Y: 120}, {X: 30, Y: 30}, {X: 30, Y: 185}, {X: menuWidth, Y: menuHeight}} {
+	for _, pt := range []win.POINT{{X: -1, Y: 120}, {X: 30, Y: 30}, {X: 30, Y: 164}, {X: menuWidth, Y: menuHeight}} {
 		if menuHit(l, s, pt) != -1 {
 			t.Fatalf("header, separator or exterior hit: %+v", pt)
 		}
@@ -89,7 +89,7 @@ func TestTrayMenuSnapshot(t *testing.T) {
 	a := &app{statusText: "Status: running", statusLabel: "running", running: true,
 		startEnabled: false, stopEnabled: true, bootEnabled: true, configEnabled: true, bootChecked: true}
 	s := a.menuSnapshot()
-	if s.badge != "RUNNING" || s.status != "running" || s.isError || !s.items[3].checked {
+	if s.badge != "RUNNING" || s.isError || !s.items[3].checked {
 		t.Fatalf("running snapshot = %+v", s)
 	}
 	for i, id := range []uint32{menuStart, menuStop, menuConfig, menuBoot, menuQuit} {
@@ -102,7 +102,7 @@ func TestTrayMenuSnapshot(t *testing.T) {
 	if busy.badge != "BUSY" || busy.items[0].enabled || busy.items[1].enabled || busy.items[3].enabled || !busy.items[2].enabled || !busy.items[4].enabled {
 		t.Fatalf("busy snapshot = %+v", busy)
 	}
-	if !a.stopEnabled || !a.bootEnabled || s != (menuSnapshot{status: "running", badge: "RUNNING", items: [menuRows]menuItem{
+	if !a.stopEnabled || !a.bootEnabled || a.statusText != "Status: running" || s != (menuSnapshot{badge: "RUNNING", items: [menuRows]menuItem{
 		{menuStart, "Start", false, false}, {menuStop, "Stop", true, false},
 		{menuConfig, "Open config folder", true, false}, {menuBoot, "Start on boot", true, true}, {menuQuit, "Quit", true, false},
 	}}) {
@@ -133,6 +133,38 @@ func TestTrayMenuSnapshot(t *testing.T) {
 	stopped := (&app{statusLabel: "stopped"}).menuSnapshot()
 	if stopped.badge != "STOPPED" {
 		t.Fatal("expected stopped badge")
+	}
+}
+
+func TestTrayMenuStatusOnlyInBadge(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		app  *app
+		want string
+	}{
+		{"running", &app{running: true, statusLabel: "running", statusText: "Status: running"}, "RUNNING"},
+		{"cached", &app{running: true, statusLabel: "running", statusText: "Status: running (cached)"}, "RUNNING"},
+		{"stopped", &app{statusLabel: "stopped", statusText: "Status: stopped"}, "STOPPED"},
+		{"checking", &app{statusText: "Status: checking..."}, "CHECKING"},
+		{"error", &app{statusError: "network failure", statusText: "Status: error"}, "ERROR"},
+		{"busy", &app{statusText: "Status: starting..."}, "BUSY"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a := tt.app
+			a.busy.Store(tt.name == "busy")
+			a.tooltip = appName + " - detailed status"
+			text, tooltip := a.statusText, a.tooltip
+			s := a.menuSnapshot()
+			if s.badge != tt.want || a.statusText != text || a.tooltip != tooltip {
+				t.Fatalf("badge=%q, want %q without mutating status/tooltip", s.badge, tt.want)
+			}
+			// Descriptive/cached status text is for the tooltip, not a second
+			// status label in the panel's value-only rendering snapshot.
+			a.statusText = "Status: another description"
+			if got := a.menuSnapshot(); got != s {
+				t.Fatal("panel must not carry a duplicate status description")
+			}
+		})
 	}
 }
 
@@ -257,7 +289,7 @@ func TestTrayMenuToggleAlignment(t *testing.T) {
 			t.Fatal("off/on thumb positions must have identical insets")
 		}
 		for _, r := range []win.RECT{offTrack, off, on} {
-			if delta := (r.Top+r.Bottom)-(row.Top+row.Bottom); delta < -1 || delta > 1 {
+			if delta := (r.Top + r.Bottom) - (row.Top + row.Bottom); delta < -1 || delta > 1 {
 				t.Fatalf("switch is not vertically centered in row: %+v, %+v", row, r)
 			}
 		}

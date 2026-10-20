@@ -11,12 +11,13 @@ import (
 
 const notificationCornerDiameter = 20
 
-// These four APIs are not exported by the pinned lxn/win version.
+// These APIs are not exported by the pinned lxn/win version.
 var (
 	notificationGDI          = syscall.NewLazyDLL("gdi32.dll")
 	notificationUser         = syscall.NewLazyDLL("user32.dll")
 	notificationCreateBrush  = notificationGDI.NewProc("CreateSolidBrush")
 	notificationCreatePen    = notificationGDI.NewProc("CreatePen")
+	notificationPatBlt       = notificationGDI.NewProc("PatBlt")
 	notificationCreateRegion = notificationGDI.NewProc("CreateRoundRectRgn")
 	notificationSetRegion    = notificationUser.NewProc("SetWindowRgn")
 )
@@ -56,8 +57,8 @@ func notificationPresentation(n notification) notification {
 }
 
 type notificationCardLayout struct {
-	brand, title, body, icon win.RECT
-	showIcon                 bool
+	brand, title, body, icon, duration, close win.RECT
+	showIcon                                  bool
 }
 
 func notificationLayout(width, height int32) notificationCardLayout {
@@ -77,7 +78,22 @@ func notificationLayout(width, height int32) notificationCardLayout {
 	if showIcon {
 		layout.icon = win.RECT{Left: 16, Top: 39, Right: 52, Bottom: 75}
 	}
+	size := min(int32(24), width, height)
+	// Equal top/right insets keep the button balanced in the rounded corner.
+	mx, my := min(int32(8), (width-size)/2), min(int32(8), (height-size)/2)
+	layout.close = win.RECT{Left: width - mx - size, Top: my, Right: width - mx, Bottom: my + size}
+	layout.brand.Right = max(left, min(right, layout.close.Left-8))
+	if layout.brand.Right-left >= 180 {
+		layout.duration = layout.brand
+		layout.duration.Left = layout.duration.Right - 80
+		layout.brand.Right = layout.duration.Left - 8
+	}
 	return layout
+}
+
+func notificationCloseHit(layout notificationCardLayout, point win.POINT) bool {
+	r := layout.close
+	return point.X >= r.Left && point.X < r.Right && point.Y >= r.Top && point.Y < r.Bottom
 }
 
 func notificationFont(height, weight int32) win.LOGFONT {
@@ -139,7 +155,7 @@ func notificationPen(color win.COLORREF, width int32) win.HGDIOBJ {
 	return win.HGDIOBJ(pen)
 }
 
-func drawNotificationCard(dc win.HDC, rect win.RECT, content notification) {
+func drawNotificationCard(dc win.HDC, rect win.RECT, content notification, close notificationCloseState) {
 	// Save/restore also protects the animation DC's text settings/current point.
 	saved := win.SaveDC(dc)
 	if saved == 0 {
@@ -163,8 +179,44 @@ func drawNotificationCard(dc win.HDC, rect win.RECT, content notification) {
 	}
 	win.SetBkMode(dc, win.TRANSPARENT)
 	drawNotificationText(dc, "wsl-tunneling", layout.brand, theme.brand, 11, win.FW_NORMAL, false)
+	if content.timed {
+		drawNotificationTextAligned(dc, notificationDuration(content.elapsed), layout.duration, theme.body, 11, win.FW_NORMAL,
+			win.DT_RIGHT|win.DT_SINGLELINE|win.DT_END_ELLIPSIS|win.DT_NOPREFIX)
+	}
 	drawNotificationText(dc, content.title, layout.title, theme.title, 17, win.FW_SEMIBOLD, false)
 	drawNotificationText(dc, content.message, layout.body, theme.body, 13, win.FW_NORMAL, true)
+	drawNotificationClose(dc, layout.close, theme, close)
+}
+
+func drawNotificationClose(dc win.HDC, rect win.RECT, theme notificationPalette, state notificationCloseState) {
+	if rect.Right-rect.Left < 12 || rect.Bottom-rect.Top < 12 {
+		return
+	}
+	color := theme.brand
+	if state.hovered {
+		color = theme.title
+		background := theme.border
+		if state.pressed {
+			background = theme.disk
+		}
+		withNotificationObject(dc, notificationBrush(background), func() {
+			old := win.SelectObject(dc, win.GetStockObject(win.NULL_PEN))
+			defer win.SelectObject(dc, old)
+			// With NULL_PEN, GDI omits the last row/column of this fill.
+			win.RoundRect(dc, rect.Left, rect.Top, rect.Right+1, rect.Bottom+1, 8, 8)
+		})
+	}
+	// Pixel-aligned, mirrored spans avoid GDI LineTo's excluded endpoints and
+	// asymmetric thick-pen caps. Both diagonals occupy the same centered 10x10 box.
+	const size int32 = 10
+	left, top := rect.Left+(rect.Right-rect.Left-size)/2, rect.Top+(rect.Bottom-rect.Top-size)/2
+	withNotificationObject(dc, notificationBrush(color), func() {
+		for row := int32(0); row < size; row++ {
+			start, end := max(int32(0), row-1), min(size, row+2)
+			notificationPatBlt.Call(uintptr(dc), uintptr(left+start), uintptr(top+row), uintptr(end-start), 1, win.PATCOPY)
+			notificationPatBlt.Call(uintptr(dc), uintptr(left+size-end), uintptr(top+row), uintptr(end-start), 1, win.PATCOPY)
+		}
+	})
 }
 
 func drawNotificationText(dc win.HDC, text string, rect win.RECT, color win.COLORREF, height, weight int32, wrap bool) {

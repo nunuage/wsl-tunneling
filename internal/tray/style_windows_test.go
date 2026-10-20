@@ -3,12 +3,11 @@
 package tray
 
 import (
-	"image"
 	"image/png"
 	"os"
 	"syscall"
 	"testing"
-	"unsafe"
+	"time"
 
 	"github.com/lxn/win"
 )
@@ -21,6 +20,7 @@ func TestNotificationPresentation(t *testing.T) {
 		want string
 	}{
 		{"start", notification{title: "Tunnel started", message: "start completed"}, "WSL networking is ready."},
+		{"timed start", operationNotification("start", "started", 4774*time.Millisecond, nil), "WSL networking is ready."},
 		{"stop", notification{title: "Tunnel stopped", message: "stop completed"}, "Previous network settings restored."},
 		{"normalized", notification{message: " START completed \r\n"}, "WSL networking is ready."},
 		{"error preserved", notification{message: "start completed", isError: true}, "start completed"},
@@ -32,7 +32,7 @@ func TestNotificationPresentation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			original := tt.in
 			got := notificationPresentation(tt.in)
-			if got.message != tt.want || got.title != tt.in.title || got.isError != tt.in.isError {
+			if got.message != tt.want || got.title != tt.in.title || got.isError != tt.in.isError || got.elapsed != tt.in.elapsed || got.timed != tt.in.timed {
 				t.Fatalf("presentation = %+v, want message %q with unchanged metadata", got, tt.want)
 			}
 			if tt.in != original {
@@ -53,14 +53,41 @@ func TestNotificationCardLayout(t *testing.T) {
 	if layout.brand.Bottom > layout.title.Top || layout.title.Bottom > layout.body.Top || layout.icon.Right >= layout.title.Left {
 		t.Fatal("brand, title, body and icon must not overlap")
 	}
+	if layout.close != (win.RECT{Left: 308, Top: 8, Right: 332, Bottom: 32}) ||
+		layout.brand.Right >= layout.duration.Left || layout.duration.Right >= layout.close.Left || layout.close.Bottom > layout.title.Top {
+		t.Fatalf("brand, duration and close button must have separate space: %+v", layout)
+	}
+	if layout.close.Top != 340-layout.close.Right {
+		t.Fatal("close button must have equal top and right insets")
+	}
 	for _, size := range [][2]int32{{340, 112}, {240, 100}, {168, 48}, {1, 1}, {0, 0}, {-1, -1}} {
 		w, h := max(0, size[0]), max(0, size[1])
 		got := notificationLayout(size[0], size[1])
-		for _, rect := range []win.RECT{got.brand, got.title, got.body, got.icon} {
+		for _, rect := range []win.RECT{got.brand, got.title, got.body, got.icon, got.duration, got.close} {
 			if rect.Left < 0 || rect.Top < 0 || rect.Right > w || rect.Bottom > h || rect.Right < rect.Left || rect.Bottom < rect.Top {
 				t.Fatalf("layout for %v escapes client: %+v", size, rect)
 			}
 		}
+	}
+}
+
+func TestNotificationCloseHit(t *testing.T) {
+	layout := notificationLayout(340, 112)
+	for _, tt := range []struct {
+		point win.POINT
+		want  bool
+	}{
+		{win.POINT{X: 308, Y: 8}, true}, {win.POINT{X: 331, Y: 31}, true},
+		{win.POINT{X: 332, Y: 20}, false}, {win.POINT{X: 320, Y: 32}, false},
+		{win.POINT{X: 307, Y: 20}, false}, {win.POINT{X: 320, Y: 7}, false},
+		{win.POINT{X: 150, Y: 70}, false}, {win.POINT{X: -1, Y: -1}, false},
+	} {
+		if got := notificationCloseHit(layout, tt.point); got != tt.want {
+			t.Fatalf("close hit at %+v = %t, want %t", tt.point, got, tt.want)
+		}
+	}
+	if notificationCloseHit(notificationLayout(0, 0), win.POINT{}) {
+		t.Fatal("empty layout must have no close target")
 	}
 }
 
@@ -100,34 +127,11 @@ func TestNotificationCardPreview(t *testing.T) {
 	if output == "" {
 		t.Skip("offscreen preview not requested")
 	}
-	dc := win.CreateCompatibleDC(0)
-	if dc == 0 {
-		t.Fatal("create preview DC")
-	}
-	defer win.DeleteDC(dc)
 	const width, height = 340, 112
-	header := win.BITMAPINFOHEADER{
-		BiSize: uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})),
-		BiWidth: width, BiHeight: -height, BiPlanes: 1, BiBitCount: 32, BiCompression: win.BI_RGB,
-	}
-	var bits unsafe.Pointer
-	bitmap := win.CreateDIBSection(dc, &header, win.DIB_RGB_COLORS, &bits, 0, 0)
-	if bitmap == 0 || bits == nil {
-		t.Fatal("create preview bitmap")
-	}
-	defer win.DeleteObject(win.HGDIOBJ(bitmap))
-	previous := win.SelectObject(dc, win.HGDIOBJ(bitmap))
-	defer win.SelectObject(dc, previous)
-	drawNotificationCard(dc, win.RECT{Right: width, Bottom: height},
-		notification{title: "Tunnel started", message: "start completed"})
-	// Flush deferred GDI operations before reading DIB memory.
-	flush := syscall.NewLazyDLL("gdi32.dll").NewProc("GdiFlush")
-	flush.Call()
-	bgra := unsafe.Slice((*byte)(bits), width*height*4)
-	preview := image.NewRGBA(image.Rect(0, 0, width, height))
-	for i := 0; i < len(bgra); i += 4 {
-		preview.Pix[i], preview.Pix[i+1], preview.Pix[i+2], preview.Pix[i+3] = bgra[i+2], bgra[i+1], bgra[i], 255
-	}
+	preview := renderNotificationTestImage(t, width, height, func(dc win.HDC) {
+		drawNotificationCard(dc, win.RECT{Right: width, Bottom: height},
+			operationNotification("start", "started", 4774*time.Millisecond, nil), notificationCloseState{})
+	})
 	file, err := os.Create(output)
 	if err != nil {
 		t.Fatal(err)

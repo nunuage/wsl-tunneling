@@ -3,7 +3,6 @@
 package tray
 
 import (
-	"strings"
 	"unsafe"
 
 	"github.com/lxn/win"
@@ -11,7 +10,7 @@ import (
 
 const (
 	menuWidth      = 344
-	menuHeight     = 332
+	menuHeight     = 308
 	menuRows       = 5
 	menuLabelFlags = win.DT_SINGLELINE | win.DT_VCENTER | win.DT_END_ELLIPSIS | win.DT_NOPREFIX
 	menuBadgeFlags = menuLabelFlags | win.DT_CENTER
@@ -27,9 +26,9 @@ type menuItem struct {
 // Value-only snapshot: painting and input never hold the app mutex or read
 // mutable worker fields. No network, service or filesystem calls are made here.
 type menuSnapshot struct {
-	status, badge string
-	isError       bool
-	items         [menuRows]menuItem
+	badge   string
+	isError bool
+	items   [menuRows]menuItem
 }
 
 func (a *app) menuSnapshot() menuSnapshot {
@@ -37,7 +36,6 @@ func (a *app) menuSnapshot() menuSnapshot {
 	defer a.mu.Unlock()
 	busy := a.busy.Load()
 	s := menuSnapshot{
-		status:  notificationText(strings.TrimPrefix(a.statusText, "Status: "), 160),
 		badge:   "STOPPED",
 		isError: a.statusError != "" || a.bootError != "",
 		items: [menuRows]menuItem{
@@ -87,8 +85,8 @@ func menuBounds(work win.RECT, cursor win.POINT) win.RECT {
 }
 
 type menuCardLayout struct {
-	brand, title, status, badge win.RECT
-	rows                        [menuRows]win.RECT
+	brand, title, badge win.RECT
+	rows                [menuRows]win.RECT
 }
 
 func menuLayout(width, height int32) menuCardLayout {
@@ -100,9 +98,9 @@ func menuLayout(width, height int32) menuCardLayout {
 	}
 	l := menuCardLayout{
 		brand: box(20, 19, w-112, 35), badge: box(w-100, 16, w-20, 39),
-		title: box(20, 46, w-20, 71), status: box(20, 77, w-20, 96),
+		title: box(20, 46, w-20, 71),
 	}
-	y := int32(104)
+	y := int32(80)
 	for i := range l.rows {
 		l.rows[i] = box(min(12, w/2), y, w-min(12, w/2), y+40)
 		y += 40
@@ -222,7 +220,6 @@ func drawMenuCard(dc win.HDC, rect win.RECT, s menuSnapshot, selected int) {
 	win.SetBkMode(dc, win.TRANSPARENT)
 	drawNotificationText(dc, appName, l.brand, theme.brand, 11, win.FW_NORMAL, false)
 	drawNotificationText(dc, "Tunnel controls", l.title, theme.title, 19, win.FW_SEMIBOLD, false)
-	drawNotificationText(dc, s.status, l.status, theme.body, 13, win.FW_NORMAL, false)
 	badgeColor, badgeText := theme.disk, theme.accent
 	if s.badge != "RUNNING" && s.badge != "ERROR" {
 		badgeColor, badgeText = theme.border, theme.body

@@ -38,15 +38,22 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) int {
 	command := args[0]
 	commandArgs := args[1:]
 
-	cfg, configPath, err := parseConfig(commandArgs, stderr)
+	cfg, configPath, timings, err := parseConfig(commandArgs, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if timings && command != "start" {
+		fmt.Fprintln(stderr, "--timings is only supported with start")
 		return 2
 	}
 
 	ctx := context.Background()
 	switch command {
 	case "start":
+		if timings {
+			return runErr(stderr, network.NewManager(cfg).StartWithTimings(ctx, stdout))
+		}
 		return runErr(stderr, network.NewManager(cfg).Start(ctx))
 	case "stop":
 		return runErr(stderr, network.NewManager(cfg).Stop(ctx))
@@ -83,7 +90,7 @@ func isCommand(command string) bool {
 	}
 }
 
-func parseConfig(args []string, stderr io.Writer) (config.Config, string, error) {
+func parseConfig(args []string, stderr io.Writer) (config.Config, string, bool, error) {
 	flags := flag.NewFlagSet("wsl-tunneling", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", config.DefaultPath(), "path to config.json")
@@ -95,14 +102,15 @@ func parseConfig(args []string, stderr io.Writer) (config.Config, string, error)
 	gvproxyURL := flags.String("gvproxy-url", "", "explicit gvproxy download URL")
 	gvforwarderURL := flags.String("gvforwarder-url", "", "explicit gvforwarder download URL")
 	terminateOnStop := flags.Bool("terminate-on-stop", false, "terminate the target WSL distro after stop")
+	timings := flags.Bool("timings", false, "print startup phase timings (start only)")
 
 	if err := flags.Parse(args); err != nil {
-		return config.Config{}, "", err
+		return config.Config{}, "", false, err
 	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		return config.Config{}, "", err
+		return config.Config{}, "", false, err
 	}
 	if *distro != "" {
 		cfg.Distro = *distro
@@ -129,7 +137,7 @@ func parseConfig(args []string, stderr io.Writer) (config.Config, string, error)
 		cfg.TerminateOnStop = true
 	}
 
-	return cfg, *configPath, nil
+	return cfg, *configPath, *timings, nil
 }
 
 func status(ctx context.Context, cfg config.Config, stdout io.Writer, stderr io.Writer) int {
@@ -260,6 +268,7 @@ func usage(output io.Writer) {
 		"  --iface NAME",
 		"  --gvproxy-url URL",
 		"  --gvforwarder-url URL",
+		"  --timings       print phase timings (start only)",
 		"",
 	}, "\n")
 	_, _ = fmt.Fprint(output, message)

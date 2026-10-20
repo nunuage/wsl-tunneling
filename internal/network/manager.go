@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/clooooud/wsl-tunneling/internal/config"
@@ -14,7 +15,14 @@ import (
 
 type Manager struct {
 	Config config.Config
-	WSL    wsl.Client
+	WSL    wslClient
+}
+
+type wslClient interface {
+	DistroExists(context.Context, string) (bool, error)
+	IsRunning(context.Context, string) (bool, error)
+	Bash(context.Context, string, string) (wsl.Result, error)
+	Terminate(context.Context, string) error
 }
 
 type Status struct {
@@ -30,6 +38,17 @@ func NewManager(cfg config.Config) Manager {
 }
 
 func (manager Manager) Start(ctx context.Context) error {
+	return manager.start(ctx, nil)
+}
+
+// StartWithTimings starts the tunnel normally and writes diagnostic phase timings.
+// Shell subphases are included in their enclosing WSL phase, not additional time.
+func (manager Manager) StartWithTimings(ctx context.Context, output io.Writer) error {
+	return manager.start(ctx, newStartProfiler(output))
+}
+
+func (manager Manager) start(ctx context.Context, profiler *startProfiler) error {
+	defer profiler.finish()
 	if err := manager.Config.Validate(); err != nil {
 		return err
 	}
@@ -41,8 +60,10 @@ func (manager Manager) Start(ctx context.Context) error {
 		return err
 	}
 	defer lock.Release()
+	profiler.mark("prepare_local")
 
 	exists, err := manager.WSL.DistroExists(ctx, manager.Config.Distro)
+	profiler.mark("check_distro")
 	if err != nil {
 		return err
 	}
@@ -51,6 +72,7 @@ func (manager Manager) Start(ctx context.Context) error {
 	}
 
 	assets, err := gvisor.Ensure(ctx, manager.Config)
+	profiler.mark("ensure_assets")
 	if err != nil {
 		return err
 	}
@@ -62,20 +84,38 @@ func (manager Manager) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	profiler.mark("convert_paths")
 	dnsSearchSuffixes := dns.NormalizeSearchSuffixes(manager.Config.DNSSearchSuffixes)
 	if len(dnsSearchSuffixes) == 0 {
 		if suffixes, err := dns.SearchSuffixes(ctx); err == nil {
 			dnsSearchSuffixes = suffixes
 		}
 	}
+	profiler.mark("dns_suffixes")
 
-	_, err = manager.WSL.Bash(ctx, manager.Config.Distro, startScript(manager.Config, gvproxyPath, gvforwarderPath, dnsSearchSuffixes))
+	return manager.startTunnel(ctx, gvproxyPath, gvforwarderPath, dnsSearchSuffixes, profiler)
+}
+
+func (manager Manager) startTunnel(ctx context.Context, gvproxyPath, gvforwarderPath string, dnsSearchSuffixes []string, profiler *startProfiler) error {
+	result, err := manager.WSL.Bash(ctx, manager.Config.Distro, startScript(manager.Config, gvproxyPath, gvforwarderPath, dnsSearchSuffixes, profiler != nil))
+	profiler.mark("wsl_start")
+	profiler.shell("wsl_start", result.Stderr)
 	if err != nil {
 		return err
 	}
-	_, err = manager.WSL.Bash(ctx, manager.Config.Distro, stabilizeScript(manager.Config))
-	if err != nil {
-		return err
+	// Closing the launching wsl.exe session can reconnect Windows interop and
+	// recreate the TAP interface. Validate after that handoff, not just before.
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if strings.TrimSpace(line) != "forwarder_started=1" {
+			continue
+		}
+		result, err = manager.WSL.Bash(ctx, manager.Config.Distro, stabilizeScript(manager.Config, dnsSearchSuffixes, profiler != nil))
+		profiler.mark("wsl_stabilize")
+		profiler.shell("wsl_stabilize", result.Stderr)
+		if err != nil {
+			return err
+		}
+		break
 	}
 	return nil
 }
@@ -131,9 +171,11 @@ func (manager Manager) Status(ctx context.Context) (Status, error) {
 	return status, nil
 }
 
-func startScript(cfg config.Config, gvproxyPath string, gvforwarderPath string, dnsSearchSuffixes []string) string {
+func startScript(cfg config.Config, gvproxyPath string, gvforwarderPath string, dnsSearchSuffixes []string, timings bool) string {
 	return fmt.Sprintf(`
 set -eu
+%s
+timing_mark begin
 STATE=%s
 IFACE=%s
 GATEWAY=%s
@@ -141,19 +183,19 @@ DEVICE=%s
 GVPROXY=%s
 GVFORWARDER=%s
 DNS_SEARCH=%s
+%s
+check_readiness_tools || exit 4
 mkdir -p "$STATE"
 FORWARDER_RUNNING=0
-if [ -f "$STATE/vm.pid" ]; then
-	GPID=$(cat "$STATE/vm.pid")
-	if kill -0 "$GPID" >/dev/null 2>&1 && ps -p "$GPID" -o args= | grep -q "$STATE/gvforwarder"; then
-		FORWARDER_RUNNING=1
-	fi
+if forwarder_running; then
+	FORWARDER_RUNNING=1
 fi
 if [ "$FORWARDER_RUNNING" != "1" ]; then
 	pkill -f "$STATE/gvforwarder" >/dev/null 2>&1 || true
 	ip link del "$IFACE" >/dev/null 2>&1 || true
 	rm -f "$STATE/vm.pid"
 fi
+timing_mark prepare_state
 if [ -f /mnt/wsl/resolv.conf ] && [ ! -e "$STATE/resolv.mnt.orig" ] && ! grep -q "^nameserver $GATEWAY$" /mnt/wsl/resolv.conf 2>/dev/null; then
 	cp -f /mnt/wsl/resolv.conf "$STATE/resolv.mnt.orig" 2>/dev/null || true
 fi
@@ -168,12 +210,11 @@ if [ -e /etc/wsl.conf ] && [ ! -e "$STATE/wsl.conf.orig" ]; then
 	' /etc/wsl.conf > "$STATE/wsl.conf.orig" 2>/dev/null || cp -a /etc/wsl.conf "$STATE/wsl.conf.orig" 2>/dev/null || true
 fi
 ROUTE=$(ip route show default | head -n1 || true)
-if echo "$ROUTE" | grep -q "$GATEWAY" && [ "$FORWARDER_RUNNING" = "1" ]; then
-	if [ -f "$STATE/route.dat" ]; then
-		ROUTE=$(cat "$STATE/route.dat")
-	else
-		ROUTE=""
-	fi
+if [ "$FORWARDER_RUNNING" = "1" ] && [ -f "$STATE/route.dat" ]; then
+	# An in-place repair must not replace the original route backup with drift.
+	ROUTE=$(cat "$STATE/route.dat")
+elif echo "$ROUTE" | grep -q "$GATEWAY" && [ "$FORWARDER_RUNNING" = "1" ]; then
+	ROUTE=""
 else
 	printf '%%s\n' "$ROUTE" > "$STATE/route.dat"
 fi
@@ -187,6 +228,7 @@ if [ -n "$ROUTE" ] && ! echo "$ROUTE" | grep -q '^default '; then
 	echo "route state is not a default route: $ROUTE" >&2
 	exit 3
 fi
+timing_mark backup_network
 if %s; then
 	if ! grep -q '# wsl-tunneling begin' /etc/wsl.conf 2>/dev/null; then
     {
@@ -198,32 +240,16 @@ if %s; then
     } >> /etc/wsl.conf
   fi
 fi
-rm -f /etc/resolv.conf
-write_resolv_conf() {
-	{
-		printf 'nameserver %%s\n' "$GATEWAY"
-		if [ -n "$DNS_SEARCH" ]; then
-			printf 'search %%s\n' "$DNS_SEARCH"
-		fi
-	} > /etc/resolv.conf
-	cp -f /etc/resolv.conf /mnt/wsl/resolv.conf 2>/dev/null || true
-}
+%s
 write_resolv_conf
 if ! ip link show "$IFACE" >/dev/null 2>&1; then
   ip tuntap add dev "$IFACE" mode tap
 fi
-configure_network() {
-	if ! ip link show "$IFACE" >/dev/null 2>&1; then
-		ip tuntap add dev "$IFACE" mode tap
-	fi
-	ip link set dev "$IFACE" address 5a:94:ef:e4:0c:ee mtu 1500 up
-	ip addr replace "$DEVICE/24" dev "$IFACE"
-	ip route replace default via "$GATEWAY" dev "$IFACE"
-}
-NEW_FORWARDER=0
+timing_mark configure_dns_interface
 if [ "$FORWARDER_RUNNING" != "1" ]; then
 	cp -f "$GVFORWARDER" "$STATE/gvforwarder"
 	chmod +x "$STATE/gvforwarder"
+	timing_mark copy_forwarder
 	STARTED=0
 	: > "$STATE/gvforwarder.log"
 	: > "$STATE/gvforwarder.err"
@@ -231,35 +257,32 @@ if [ "$FORWARDER_RUNNING" != "1" ]; then
 		echo "starting gvforwarder attempt $ATTEMPT" >> "$STATE/gvforwarder.err"
 		nohup "$STATE/gvforwarder" -preexisting -iface "$IFACE" -stop-if-exist ignore -url "stdio:$GVPROXY?listen-stdio=accept&ssh-port=-1" >> "$STATE/gvforwarder.log" 2>> "$STATE/gvforwarder.err" < /dev/null &
 		echo $! > "$STATE/vm.pid"
-		for _ in 1 2 3; do
-			sleep 1
-			if ! kill -0 "$(cat "$STATE/vm.pid")" >/dev/null 2>&1; then
-				break
-			fi
-		done
-		if kill -0 "$(cat "$STATE/vm.pid")" >/dev/null 2>&1; then
+		timing_mark launch_forwarder
+		# Confirm the connection, then let the launching WSL session exit.
+		# The manager validates stability again after the interop handoff.
+		if wait_for_network 15 1; then
 			STARTED=1
 			break
 		fi
 		pkill -f "$STATE/gvforwarder" >/dev/null 2>&1 || true
 		rm -f "$STATE/vm.pid"
-		sleep 1
 	done
 	if [ "$STARTED" != "1" ]; then
-		echo "gvforwarder did not stay running" >&2
+		echo "tunnel did not become ready after 3 attempts (15s readiness timeout per attempt)" >&2
 		cat "$STATE/gvforwarder.err" >&2 2>/dev/null || true
 		exit 42
 	fi
-	NEW_FORWARDER=1
+	echo forwarder_started=1
+else
+	timing_mark launch_forwarder
+	# Reuse a healthy tunnel immediately; repair route/address/DNS drift in place.
+	if ! wait_for_network 15 1; then
+		echo "running tunnel did not become ready within 15s; stop/start to retry" >&2
+		exit 42
+	fi
 fi
-if [ "$NEW_FORWARDER" = "1" ]; then
-  for _ in 1 2 3 4 5 6; do
-    configure_network
-    sleep 1
-  done
-fi
-configure_network
-`, shellQuote(cfg.StateDirWSL), shellQuote(cfg.InterfaceName), shellQuote(cfg.GatewayIP), shellQuote(cfg.DeviceIP), shellQuote(gvproxyPath), shellQuote(gvforwarderPath), shellQuote(strings.Join(dnsSearchSuffixes, " ")), shellBool(cfg.DisableAutoResolv))
+timing_mark wait_ready
+`, shellTimingPreamble(timings), shellQuote(cfg.StateDirWSL), shellQuote(cfg.InterfaceName), shellQuote(cfg.GatewayIP), shellQuote(cfg.DeviceIP), shellQuote(gvproxyPath), shellQuote(gvforwarderPath), shellQuote(strings.Join(dnsSearchSuffixes, " ")), networkReadinessScript(), shellBool(cfg.DisableAutoResolv), networkConfigurationScript())
 }
 
 func stopScript(cfg config.Config) string {
@@ -354,29 +377,25 @@ rm -rf "$STATE"
 `, shellQuote(cfg.StateDirWSL), shellQuote(cfg.InterfaceName), shellQuote(cfg.GatewayIP))
 }
 
-func stabilizeScript(cfg config.Config) string {
+func stabilizeScript(cfg config.Config, dnsSearchSuffixes []string, timings bool) string {
 	return fmt.Sprintf(`
 set -eu
+%s
+timing_mark begin
 STATE=%s
 IFACE=%s
 GATEWAY=%s
 DEVICE=%s
-configure_network() {
-	if ! ip link show "$IFACE" >/dev/null 2>&1; then
-		ip tuntap add dev "$IFACE" mode tap
-	fi
-	ip link set dev "$IFACE" address 5a:94:ef:e4:0c:ee mtu 1500 up
-	ip addr replace "$DEVICE/24" dev "$IFACE"
-	ip route replace default via "$GATEWAY" dev "$IFACE"
-}
-if [ -f "$STATE/vm.pid" ] && kill -0 "$(cat "$STATE/vm.pid")" >/dev/null 2>&1; then
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		configure_network
-		sleep 1
-	done
-	configure_network
+DNS_SEARCH=%s
+%s
+%s
+if ! wait_for_network 15 6; then
+	echo "tunnel did not stabilize after WSL interop handoff within 15s" >&2
+	cat "$STATE/gvforwarder.err" >&2 2>/dev/null || true
+	exit 42
 fi
-`, shellQuote(cfg.StateDirWSL), shellQuote(cfg.InterfaceName), shellQuote(cfg.GatewayIP), shellQuote(cfg.DeviceIP))
+timing_mark wait_ready
+`, shellTimingPreamble(timings), shellQuote(cfg.StateDirWSL), shellQuote(cfg.InterfaceName), shellQuote(cfg.GatewayIP), shellQuote(cfg.DeviceIP), shellQuote(strings.Join(dnsSearchSuffixes, " ")), networkReadinessScript(), networkConfigurationScript())
 }
 
 func statusScript(cfg config.Config) string {

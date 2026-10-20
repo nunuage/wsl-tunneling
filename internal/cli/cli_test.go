@@ -154,7 +154,7 @@ func TestParseConfigAppliesFileAndFlagInputs(t *testing.T) {
 	})
 
 	var stderr bytes.Buffer
-	cfg, gotPath, err := parseConfig([]string{
+	cfg, gotPath, timings, err := parseConfig([]string{
 		"--config", configPath,
 		"--distro", "FromFlag",
 		"--gvisor-version", "v9.9.9",
@@ -171,6 +171,9 @@ func TestParseConfigAppliesFileAndFlagInputs(t *testing.T) {
 	if gotPath != configPath {
 		t.Fatalf("parseConfig() path = %q, want %q", gotPath, configPath)
 	}
+	if timings {
+		t.Fatal("timings = true, want false by default")
+	}
 
 	assertEqual(t, "Distro", cfg.Distro, "FromFlag")
 	assertEqual(t, "GvisorVersion", cfg.GvisorVersion, "v9.9.9")
@@ -182,6 +185,26 @@ func TestParseConfigAppliesFileAndFlagInputs(t *testing.T) {
 	if !cfg.TerminateOnStop {
 		t.Fatal("TerminateOnStop = false, want true")
 	}
+}
+
+func TestRunTimingsRequiresStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-config.json")
+	code, stdout, stderr := runCLI(t, "stop", "--timings", "--config", path)
+	if code != 2 {
+		t.Fatalf("Run() code = %d, want 2", code)
+	}
+	assertEmpty(t, "stdout", stdout)
+	assertContains(t, stderr, "--timings is only supported with start")
+}
+
+func TestRunStartTimingsReportsValidationFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-config.json")
+	code, stdout, stderr := runCLI(t, "start", "--timings", "--config", path)
+	if code != 1 {
+		t.Fatalf("Run() code = %d, want 1", code)
+	}
+	assertContains(t, stdout, "start_timing total")
+	assertContains(t, stderr, "distro is required")
 }
 
 func runCLI(t *testing.T, args ...string) (int, string, string) {

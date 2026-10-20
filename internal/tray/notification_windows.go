@@ -3,7 +3,9 @@
 package tray
 
 import (
+	"fmt"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/lxn/win"
@@ -17,14 +19,16 @@ const (
 	popupHideFlags   = win.AW_HIDE | win.AW_BLEND // Never AW_ACTIVATE.
 	popupDuration    = 3000
 	popupFadeTime    = 160
-	// MA_NOACTIVATEANDEAT is not exported by this version of lxn/win.
-	popupMouseActivate = 4
+	// MA_NOACTIVATE accepts the close-button click without taking focus.
+	popupMouseActivate = 3
 )
 
 type notification struct {
 	title   string
 	message string
 	isError bool
+	elapsed time.Duration
+	timed   bool
 }
 
 type notificationPopup struct {
@@ -32,6 +36,51 @@ type notificationPopup struct {
 	timer      uintptr
 	registered bool
 	content    notification
+	close      notificationCloseState
+}
+
+func operationNotification(name, completed string, elapsed time.Duration, err error) notification {
+	n := notification{
+		title: "Tunnel " + completed, message: name + " completed",
+		elapsed: max(0, elapsed), timed: true,
+	}
+	if err != nil {
+		n.title, n.message, n.isError = name+" failed", err.Error(), true
+	}
+	return n
+}
+
+func notificationDuration(elapsed time.Duration) string {
+	elapsed = max(0, elapsed).Round(time.Millisecond)
+	if elapsed < time.Second {
+		return fmt.Sprintf("%d ms", elapsed/time.Millisecond)
+	}
+	return fmt.Sprintf("%.2f s", elapsed.Seconds())
+}
+
+// No mouse capture or activation is needed. Leaving the button cancels a press.
+type notificationCloseState struct {
+	hovered bool
+	pressed bool
+}
+
+func (s *notificationCloseState) update(message uint32, hit bool) (redraw, dismiss bool) {
+	before := *s
+	switch message {
+	case win.WM_MOUSEMOVE:
+		s.hovered = hit
+		if !hit {
+			s.pressed = false
+		}
+	case win.WM_LBUTTONDOWN:
+		s.hovered, s.pressed = hit, hit
+	case win.WM_LBUTTONUP:
+		dismiss = s.pressed && hit
+		s.hovered, s.pressed = hit, false
+	case win.WM_MOUSELEAVE, win.WM_CANCELMODE, win.WM_CAPTURECHANGED:
+		*s = notificationCloseState{}
+	}
+	return before != *s, dismiss
 }
 
 func notificationText(text string, limit int) string {
@@ -44,11 +93,12 @@ func notificationText(text string, limit int) string {
 }
 
 func (a *app) showNotification(title, message string, isError bool) {
-	n := notification{
-		title:   notificationText(title, 96),
-		message: notificationText(message, 512),
-		isError: isError,
-	}
+	a.queueNotification(notification{title: title, message: message, isError: isError})
+}
+
+func (a *app) queueNotification(n notification) {
+	n.title = notificationText(n.title, 96)
+	n.message = notificationText(n.message, 512)
 	a.enqueueNotification(n, func() bool {
 		return a.window != 0 && win.PostMessage(a.window, notificationMsg, 0, 0) != 0
 	})
@@ -110,6 +160,20 @@ func (a *app) showNextNotification() {
 	}
 }
 
+func (a *app) dismissNotification(fade bool) {
+	p := &a.popup
+	if p.window == 0 {
+		return
+	}
+	win.KillTimer(p.window, p.timer)
+	if fade {
+		// Brief, synchronous hide on this thread; no activation flag.
+		win.AnimateWindow(p.window, popupFadeTime, popupHideFlags)
+	}
+	p.destroy()
+	a.showNextNotification()
+}
+
 // Anchor to the primary monitor's work area, not its full screen rectangle:
 // taskbars on any edge and negative desktop coordinates are respected.
 func notificationBounds(work win.RECT) win.RECT {
@@ -152,6 +216,7 @@ func (p *notificationPopup) show(n notification) bool {
 		p.registered = true
 	}
 	p.content = n
+	p.close = notificationCloseState{}
 	p.window = win.CreateWindowEx(popupExStyle, stringPtr(popupClassName), nil,
 		popupStyle, bounds.Left, bounds.Top, bounds.Right-bounds.Left, bounds.Bottom-bounds.Top,
 		0, 0, win.GetModuleHandle(nil), nil)
@@ -189,7 +254,7 @@ func popupWindowProc(hwnd win.HWND, msg uint32, wparam, lparam uintptr) uintptr 
 		return 1
 	}
 	if msg == win.WM_MOUSEACTIVATE {
-		// Clicking the popup neither activates it nor delivers a client click.
+		// Deliver client clicks (for the cross) without activating the popup.
 		return popupMouseActivate
 	}
 	if currentApp != nil {
@@ -206,19 +271,36 @@ func popupWindowProc(hwnd win.HWND, msg uint32, wparam, lparam uintptr) uintptr 
 				// AnimateWindow asks the window to render into its animation DC.
 				p.draw(win.HDC(wparam))
 				return 0
+			case win.WM_MOUSEMOVE, win.WM_LBUTTONDOWN, win.WM_LBUTTONUP,
+				win.WM_MOUSELEAVE, win.WM_CANCELMODE, win.WM_CAPTURECHANGED:
+				if msg == win.WM_MOUSEMOVE {
+					setTrayArrowCursor()
+					track := win.TRACKMOUSEEVENT{
+						CbSize:  uint32(unsafe.Sizeof(win.TRACKMOUSEEVENT{})),
+						DwFlags: win.TME_LEAVE, HwndTrack: hwnd,
+					}
+					win.TrackMouseEvent(&track)
+				}
+				var rect win.RECT
+				hit := false
+				if win.GetClientRect(hwnd, &rect) {
+					point := win.POINT{X: int32(int16(lparam & 0xffff)), Y: int32(int16((lparam >> 16) & 0xffff))}
+					hit = notificationCloseHit(notificationLayout(rect.Right, rect.Bottom), point)
+				}
+				redraw, dismiss := p.close.update(msg, hit)
+				if dismiss {
+					currentApp.dismissNotification(false)
+				} else if redraw {
+					win.InvalidateRect(hwnd, nil, false)
+				}
+				return 0
 			case win.WM_TIMER:
 				if wparam == p.timer {
-					win.KillTimer(hwnd, p.timer)
-					// Brief, synchronous hide on this thread; no activation flag.
-					// DestroyWindow below is also the fallback if animation fails.
-					win.AnimateWindow(hwnd, popupFadeTime, popupHideFlags)
-					p.destroy()
-					currentApp.showNextNotification()
+					currentApp.dismissNotification(true)
 				}
 				return 0
 			case win.WM_CLOSE:
-				p.destroy()
-				currentApp.showNextNotification()
+				currentApp.dismissNotification(false)
 				return 0
 			}
 		}
@@ -255,7 +337,7 @@ func (p *notificationPopup) draw(dc win.HDC) {
 			defer win.DeleteObject(win.HGDIOBJ(bitmap))
 			old := win.SelectObject(buffer, win.HGDIOBJ(bitmap))
 			if validNotificationObject(old) {
-				drawNotificationCard(buffer, rect, p.content)
+				drawNotificationCard(buffer, rect, p.content, p.close)
 				copied := win.BitBlt(dc, 0, 0, rect.Right, rect.Bottom, buffer, 0, 0, win.SRCCOPY)
 				win.SelectObject(buffer, old)
 				if copied {
@@ -264,7 +346,7 @@ func (p *notificationPopup) draw(dc win.HDC) {
 			}
 		}
 	}
-	drawNotificationCard(dc, rect, p.content)
+	drawNotificationCard(dc, rect, p.content, p.close)
 }
 
 func (p *notificationPopup) destroy() {
@@ -275,6 +357,7 @@ func (p *notificationPopup) destroy() {
 		win.DestroyWindow(hwnd)
 	}
 	p.content = notification{}
+	p.close = notificationCloseState{}
 }
 
 func (p *notificationPopup) cleanup() {

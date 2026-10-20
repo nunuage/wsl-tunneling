@@ -348,13 +348,11 @@ func (a *app) runOperation(name string, completed string, operation func(context
 	}
 	a.setBusy(name)
 	go func() {
+		started := time.Now()
 		err := operation(a.ctx)
+		elapsed := time.Since(started)
 		a.busy.Store(false)
-		if err != nil {
-			a.showError(fmt.Sprintf("%s failed", name), err)
-		} else {
-			a.showInfo("Tunnel "+completed, fmt.Sprintf("%s completed", name))
-		}
+		a.queueNotification(operationNotification(name, completed, elapsed, err))
 		a.scheduleRefresh()
 	}()
 }
