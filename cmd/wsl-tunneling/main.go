@@ -7,10 +7,12 @@ import (
 	"os"
 
 	"github.com/clooooud/wsl-tunneling/internal/config"
+	"github.com/clooooud/wsl-tunneling/internal/process"
 	"github.com/clooooud/wsl-tunneling/internal/tray"
 )
 
 func main() {
+	process.HideConsoleWindowIfUnshared()
 	configPath, err := parseArgs(os.Args[1:])
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)

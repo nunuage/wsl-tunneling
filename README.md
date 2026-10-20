@@ -89,6 +89,10 @@ Right-click the tray icon to open the menu:
 - `Start on boot` toggles launching the tray app at Windows logon.
 - `Quit` closes the tray process.
 
+Start/stop confirmations and tray errors use a small, local Win32 popup rather than Windows notifications or dialog boxes. It appears at the bottom right of the primary display's work area, clear of the taskbar, stays for about three seconds, then fades out quickly (160 ms). The borderless, topmost popup does not take keyboard focus, activate when clicked, appear in the taskbar, play sounds, or open a console. It does not depend on Windows notification settings or Do not disturb, and it is not saved to Notification Center. Long messages are truncated to fit; the current tunnel status remains available independently in the tray menu and icon tooltip.
+
+Notifications from background operations are queued and displayed one at a time. All popup windows and timers are managed on the tray's message-loop thread; quitting discards pending notifications and destroys the popup and its timer. If a Win32 call prevents a popup from being displayed, it is skipped without opening a fallback dialog. The quick exit animation briefly occupies the UI thread; it never requests activation.
+
 To enable startup at logon from PowerShell:
 
 ```powershell
@@ -187,6 +191,7 @@ Then start your distro again normally.
 
 ## Known Limits
 
+- On Windows, the app prepares a private GUI-subsystem copy of the unsigned `gvproxy.exe` download so WSL interop cannot open a console. The original download is preserved. Custom signed console builds are rejected rather than invalidating their signature; use a GUI-subsystem build instead.
 - WSL networking is shared across distros, so the tunnel is not isolated per distro.
 - ICMP forwarding is limited by `gvisor-tap-vsock`; use TCP checks such as `curl` for validation.
 - Port forwarding and `win-sshproxy` are not part of this MVP.

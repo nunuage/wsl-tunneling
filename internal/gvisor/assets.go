@@ -38,7 +38,7 @@ func Ensure(ctx context.Context, cfg config.Config) (Assets, error) {
 
 	assets := Paths(cfg)
 	if fileExists(assets.GVProxyPath) && fileExists(assets.GVForwarderPath) {
-		return assets, nil
+		return prepareAssets(assets)
 	}
 
 	gvproxyURL := cfg.GVProxyURL
@@ -74,6 +74,15 @@ func Ensure(ctx context.Context, cfg config.Config) (Assets, error) {
 		}
 	}
 
+	return prepareAssets(assets)
+}
+
+func prepareAssets(assets Assets) (Assets, error) {
+	path, err := consoleFreeProxy(assets.GVProxyPath)
+	if err != nil {
+		return Assets{}, fmt.Errorf("prepare background gvproxy: %w", err)
+	}
+	assets.GVProxyPath = path
 	return assets, nil
 }
 

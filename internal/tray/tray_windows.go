@@ -37,6 +37,7 @@ const (
 	trayIconID      = 1
 	trayCallbackMsg = win.WM_APP + 1
 	refreshMsg      = win.WM_APP + 2
+	notificationMsg = win.WM_APP + 3
 
 	menuStatus = 1000
 	menuStart  = 1001
@@ -71,6 +72,9 @@ type app struct {
 	statusError   string
 	bootError     string
 	cacheLoaded   bool
+	closing       bool
+	notifications []notification
+	popup         notificationPopup // Accessed only by the message-loop thread.
 	busy          atomic.Bool
 	refreshing    atomic.Bool
 	closeOnce     sync.Once
@@ -149,12 +153,16 @@ func Run(ctx context.Context, cfg config.Config, configPath string) error {
 	application.scheduleRefresh()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	done := make(chan struct{})
+	defer close(done)
 
 	go func() {
 		for {
 			select {
+			case <-done:
+				return
 			case <-ctx.Done():
-				win.PostMessage(application.window, win.WM_CLOSE, 0, 0)
+				application.postMessage(win.WM_CLOSE)
 				return
 			case <-ticker.C:
 				application.scheduleRefresh()
@@ -204,9 +212,13 @@ func (a *app) createWindow() error {
 }
 
 func (a *app) destroyWindow() {
+	a.stopNotifications()
+	a.popup.cleanup()
 	if a.window != 0 {
 		win.DestroyWindow(a.window)
+		a.mu.Lock()
 		a.window = 0
+		a.mu.Unlock()
 	}
 	win.UnregisterClass(stringPtr(appName + "-tray-window"))
 }
@@ -276,6 +288,9 @@ func (a *app) handleMessage(hwnd win.HWND, msg uint32, wparam uintptr, lparam ui
 	case refreshMsg:
 		a.updateNotifyIcon()
 		return 0
+	case notificationMsg:
+		a.showNextNotification()
+		return 0
 	case win.WM_CLOSE:
 		a.close()
 		return 0
@@ -341,11 +356,20 @@ func (a *app) handleCommand(id uint32) {
 
 func (a *app) close() {
 	a.closeOnce.Do(func() {
-		a.deleteNotifyIcon()
-		if a.window != 0 {
-			win.DestroyWindow(a.window)
-		}
+		a.stopNotifications()
+		a.popup.destroy()
+		// Deferred cleanup removes the icon before destroying its owner HWND.
+		win.PostQuitMessage(0)
 	})
+}
+
+// Serialize worker posts with shutdown: no worker can post to a destroyed HWND.
+func (a *app) postMessage(msg uint32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.closing && a.window != 0 {
+		win.PostMessage(a.window, msg, 0, 0)
+	}
 }
 
 func (a *app) runOperation(name string, completed string, operation func(context.Context) error) {
@@ -393,7 +417,7 @@ func (a *app) scheduleRefresh() {
 		defer a.refreshing.Store(false)
 		a.refreshAll()
 		a.saveCache()
-		win.PostMessage(a.window, refreshMsg, 0, 0)
+		a.postMessage(refreshMsg)
 	}()
 }
 
@@ -783,11 +807,11 @@ func openFolder(owner win.HWND, dir string) error {
 }
 
 func (a *app) showError(title string, err error) {
-	messageBox(a.window, title, err.Error(), win.MB_OK|win.MB_ICONERROR)
+	a.showNotification(title, err.Error(), true)
 }
 
 func (a *app) showInfo(title string, message string) {
-	messageBox(a.window, title, message, win.MB_OK|win.MB_ICONINFORMATION)
+	a.showNotification(title, message, false)
 }
 
 func appendMenu(menu win.HMENU, id uint32, text string, enabled bool, checked bool) {
@@ -817,10 +841,6 @@ func appendSeparator(menu win.HMENU) {
 		FType:  win.MFT_SEPARATOR,
 	}
 	win.InsertMenuItem(menu, ^uint32(0), true, &item)
-}
-
-func messageBox(hwnd win.HWND, title string, message string, flags uint32) {
-	win.MessageBox(hwnd, stringPtr(message), stringPtr(title), flags)
 }
 
 func copyString(dst []uint16, value string) {
