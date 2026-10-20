@@ -139,6 +139,7 @@ func (p *notificationPopup) show(n notification) bool {
 			Style:         win.CS_DROPSHADOW,
 			LpfnWndProc:   syscallCallback(popupWindowProc),
 			HInstance:     win.GetModuleHandle(nil),
+			HCursor:       win.LoadCursor(0, win.MAKEINTRESOURCE(win.IDC_ARROW)),
 			LpszClassName: stringPtr(popupClassName),
 		}
 		if win.RegisterClassEx(&class) == 0 {
@@ -177,7 +178,16 @@ func (p *notificationPopup) show(n notification) bool {
 	return true
 }
 
+func setTrayArrowCursor() {
+	// Shared system cursor: no allocation or DestroyCursor is required.
+	win.SetCursor(win.LoadCursor(0, win.MAKEINTRESOURCE(win.IDC_ARROW)))
+}
+
 func popupWindowProc(hwnd win.HWND, msg uint32, wparam, lparam uintptr) uintptr {
+	if msg == win.WM_SETCURSOR {
+		setTrayArrowCursor()
+		return 1
+	}
 	if msg == win.WM_MOUSEACTIVATE {
 		// Clicking the popup neither activates it nor delivers a client click.
 		return popupMouseActivate

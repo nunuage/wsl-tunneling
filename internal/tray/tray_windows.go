@@ -75,6 +75,7 @@ type app struct {
 	closing       bool
 	notifications []notification
 	popup         notificationPopup // Accessed only by the message-loop thread.
+	menu          trayMenu          // Accessed only by the message-loop thread.
 	busy          atomic.Bool
 	refreshing    atomic.Bool
 	closeOnce     sync.Once
@@ -213,6 +214,7 @@ func (a *app) createWindow() error {
 
 func (a *app) destroyWindow() {
 	a.stopNotifications()
+	a.menu.cleanup()
 	a.popup.cleanup()
 	if a.window != 0 {
 		win.DestroyWindow(a.window)
@@ -278,7 +280,7 @@ func (a *app) messageLoop() {
 func (a *app) handleMessage(hwnd win.HWND, msg uint32, wparam uintptr, lparam uintptr) uintptr {
 	switch msg {
 	case trayCallbackMsg:
-		if lparam == win.WM_RBUTTONUP || lparam == win.WM_CONTEXTMENU {
+		if lparam == win.WM_LBUTTONUP || lparam == win.WM_RBUTTONUP || lparam == win.WM_CONTEXTMENU {
 			a.showMenu()
 			return 0
 		}
@@ -287,6 +289,7 @@ func (a *app) handleMessage(hwnd win.HWND, msg uint32, wparam uintptr, lparam ui
 		return 0
 	case refreshMsg:
 		a.updateNotifyIcon()
+		a.refreshMenu()
 		return 0
 	case notificationMsg:
 		a.showNextNotification()
@@ -302,41 +305,7 @@ func (a *app) handleMessage(hwnd win.HWND, msg uint32, wparam uintptr, lparam ui
 }
 
 func (a *app) showMenu() {
-	menu := win.CreatePopupMenu()
-	if menu == 0 {
-		return
-	}
-	defer win.DestroyMenu(menu)
-
-	a.mu.Lock()
-	statusText := a.statusText
-	startEnabled := a.startEnabled
-	stopEnabled := a.stopEnabled
-	bootEnabled := a.bootEnabled
-	bootChecked := a.bootChecked
-	configEnabled := a.configEnabled
-	a.mu.Unlock()
-
-	appendMenu(menu, menuStatus, statusText, false, false)
-	appendSeparator(menu)
-	appendMenu(menu, menuStart, "Start", startEnabled, false)
-	appendMenu(menu, menuStop, "Stop", stopEnabled, false)
-	appendSeparator(menu)
-	appendMenu(menu, menuConfig, "Open config folder", configEnabled, false)
-	appendMenu(menu, menuBoot, "Start on boot", bootEnabled, bootChecked)
-	appendSeparator(menu)
-	appendMenu(menu, menuQuit, "Quit", true, false)
-
-	var pt win.POINT
-	if !win.GetCursorPos(&pt) {
-		return
-	}
-
-	win.SetForegroundWindow(a.window)
-	cmd := win.TrackPopupMenuEx(menu, win.TPM_RIGHTBUTTON|win.TPM_RETURNCMD|win.TPM_NONOTIFY, pt.X, pt.Y, a.window, nil)
-	if cmd != 0 {
-		a.handleCommand(uint32(cmd))
-	}
+	a.toggleMenu()
 }
 
 func (a *app) handleCommand(id uint32) {
@@ -357,6 +326,7 @@ func (a *app) handleCommand(id uint32) {
 func (a *app) close() {
 	a.closeOnce.Do(func() {
 		a.stopNotifications()
+		a.menu.destroy()
 		a.popup.destroy()
 		// Deferred cleanup removes the icon before destroying its owner HWND.
 		win.PostQuitMessage(0)
@@ -407,6 +377,7 @@ func (a *app) setBusyText(text string) {
 	a.applyActionStateLocked(false)
 	a.mu.Unlock()
 	a.updateNotifyIcon()
+	a.refreshMenu()
 }
 
 func (a *app) scheduleRefresh() {
@@ -743,9 +714,7 @@ func (a *app) toggleStartOnBoot() {
 	if !a.busy.CompareAndSwap(false, true) {
 		return
 	}
-	a.mu.Lock()
-	a.bootEnabled = false
-	a.mu.Unlock()
+	a.setBusyText("Status: updating start on boot...")
 	go func() {
 		installed, err := service.IsInstalled(a.ctx, a.cfg)
 		if err == nil {
@@ -812,35 +781,6 @@ func (a *app) showError(title string, err error) {
 
 func (a *app) showInfo(title string, message string) {
 	a.showNotification(title, message, false)
-}
-
-func appendMenu(menu win.HMENU, id uint32, text string, enabled bool, checked bool) {
-	state := uint32(win.MFS_ENABLED)
-	if !enabled {
-		state = win.MFS_DISABLED
-	}
-	if checked {
-		state |= win.MFS_CHECKED
-	}
-	textPtr := stringPtr(text)
-	item := win.MENUITEMINFO{
-		CbSize:     uint32(unsafe.Sizeof(win.MENUITEMINFO{})),
-		FMask:      win.MIIM_ID | win.MIIM_STRING | win.MIIM_STATE,
-		FState:     state,
-		WID:        id,
-		DwTypeData: textPtr,
-		Cch:        uint32(len([]rune(text))),
-	}
-	win.InsertMenuItem(menu, ^uint32(0), true, &item)
-}
-
-func appendSeparator(menu win.HMENU) {
-	item := win.MENUITEMINFO{
-		CbSize: uint32(unsafe.Sizeof(win.MENUITEMINFO{})),
-		FMask:  win.MIIM_FTYPE,
-		FType:  win.MFT_SEPARATOR,
-	}
-	win.InsertMenuItem(menu, ^uint32(0), true, &item)
 }
 
 func copyString(dst []uint16, value string) {

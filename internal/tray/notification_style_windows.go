@@ -168,16 +168,20 @@ func drawNotificationCard(dc win.HDC, rect win.RECT, content notification) {
 }
 
 func drawNotificationText(dc win.HDC, text string, rect win.RECT, color win.COLORREF, height, weight int32, wrap bool) {
+	flags := uint32(win.DT_END_ELLIPSIS | win.DT_NOPREFIX | win.DT_SINGLELINE)
+	if wrap {
+		flags = win.DT_END_ELLIPSIS | win.DT_NOPREFIX | win.DT_WORDBREAK | win.DT_EDITCONTROL
+	}
+	drawNotificationTextAligned(dc, text, rect, color, height, weight, flags)
+}
+
+func drawNotificationTextAligned(dc win.HDC, text string, rect win.RECT, color win.COLORREF, height, weight int32, flags uint32) {
 	if rect.Right <= rect.Left || rect.Bottom <= rect.Top {
 		return
 	}
 	font := notificationFont(height, weight)
 	withNotificationObject(dc, win.HGDIOBJ(win.CreateFontIndirect(&font)), func() {
 		win.SetTextColor(dc, color)
-		flags := uint32(win.DT_END_ELLIPSIS | win.DT_NOPREFIX | win.DT_SINGLELINE)
-		if wrap {
-			flags = win.DT_END_ELLIPSIS | win.DT_NOPREFIX | win.DT_WORDBREAK | win.DT_EDITCONTROL
-		}
 		win.DrawTextEx(dc, stringPtr(text), -1, &rect, flags, nil)
 	})
 }

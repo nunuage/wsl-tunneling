@@ -81,13 +81,17 @@ Run the executable without arguments, or double-click it:
 .\wsl-tunneling.exe
 ```
 
-Right-click the tray icon to open the menu:
+Left-click or right-click the tray icon to toggle the controls panel:
 
 - `Start` starts the WSL tunnel.
 - `Stop` stops it and restores WSL route/DNS state.
 - `Open config folder` opens `%APPDATA%\wsl-tunneling` and creates an example config if missing.
 - `Start on boot` toggles launching the tray app at Windows logon.
 - `Quit` closes the tray process.
+
+The custom Win32 panel matches the notifications: slate palette, Segoe UI, rounded corners, subtle border and a system shadow when available, with double-buffered painting. It opens near the cursor within that monitor's work area and shows a live status badge, disabled actions, hover/keyboard selection and the checked startup toggle. Use Up/Down or Tab/Shift+Tab to move between enabled actions, Home/End for the first/last action, and Enter/Space to activate. Escape, an outside click or loss of focus closes it; clicking the tray icon again also closes it. Unlike notifications, this interactive panel takes keyboard focus, but has no taskbar entry and opens no console. Status updates refresh an already-open panel without querying the tunnel from the renderer.
+
+Panel geometry, hit-testing, selection, command validation and state snapshots have pure tests that do not create windows. An optional offscreen GDI PNG preview is available through the `WSL_TUNNELING_MENU_PREVIEW` output-path environment variable and the targeted `TestTrayMenuPreview` test; it does not launch the application or exercise desktop input, focus, capture or monitor APIs.
 
 Start/stop confirmations and tray errors use a small, local Win32 popup rather than Windows notifications or dialog boxes. It appears at the bottom right of the primary display's work area, clear of the taskbar, stays for about three seconds, then fades out quickly (160 ms). The borderless, topmost popup does not take keyboard focus, activate when clicked, appear in the taskbar, play sounds, or open a console. It does not depend on Windows notification settings or Do not disturb, and it is not saved to Notification Center. Long messages are truncated to fit; the current tunnel status remains available independently in the tray menu and icon tooltip.
 
