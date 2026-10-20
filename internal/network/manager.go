@@ -62,13 +62,20 @@ func (manager Manager) start(ctx context.Context, profiler *startProfiler) error
 	defer lock.Release()
 	profiler.mark("prepare_local")
 
-	exists, err := manager.WSL.DistroExists(ctx, manager.Config.Distro)
-	profiler.mark("check_distro")
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("WSL distro %q does not exist", manager.Config.Distro)
+	// Cached starts validate the distro in the first real WSL command. Keep
+	// the early check for installation, so a typo cannot trigger downloads.
+	cached := gvisor.Status(manager.Config)
+	if cached["gvproxy"] && cached["gvforwarder"] {
+		profiler.skipped("check_distro")
+	} else {
+		exists, err := manager.WSL.DistroExists(ctx, manager.Config.Distro)
+		profiler.mark("check_distro")
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("WSL distro %q does not exist", manager.Config.Distro)
+		}
 	}
 
 	assets, err := gvisor.Ensure(ctx, manager.Config)
@@ -101,6 +108,15 @@ func (manager Manager) startTunnel(ctx context.Context, gvproxyPath, gvforwarder
 	profiler.mark("wsl_start")
 	profiler.shell("wsl_start", result.Stderr)
 	if err != nil {
+		// Diagnose only a failed first session, never a healthy start or an
+		// interop handoff failure. Preserve the original error and errors.Is.
+		if ctx.Err() == nil {
+			exists, checkErr := manager.WSL.DistroExists(ctx, manager.Config.Distro)
+			profiler.mark("diagnose_distro")
+			if checkErr == nil && !exists {
+				return fmt.Errorf("WSL distro %q does not exist: %w", manager.Config.Distro, err)
+			}
+		}
 		return err
 	}
 	// Closing the launching wsl.exe session can reconnect Windows interop and

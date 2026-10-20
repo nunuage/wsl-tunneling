@@ -34,6 +34,14 @@ func (profiler *startProfiler) mark(phase string) {
 	profiler.previous = now
 }
 
+func (profiler *startProfiler) skipped(phase string) {
+	if profiler == nil {
+		return
+	}
+	profiler.mark(phase)
+	_, _ = fmt.Fprintf(profiler.output, "start_note %s skipped (assets cached; WSL validates distro on execution)\n", phase)
+}
+
 func (profiler *startProfiler) finish() {
 	if profiler != nil {
 		profiler.write("total", time.Since(profiler.started))

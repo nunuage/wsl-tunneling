@@ -47,7 +47,18 @@ func (client Client) Exec(ctx context.Context, distro string, commandArgs ...str
 }
 
 func (client Client) Bash(ctx context.Context, distro string, script string) (Result, error) {
-	return client.Exec(ctx, distro, "bash", "-lc", script)
+	return client.Exec(ctx, distro, bashArgs(script)...)
+}
+
+// Internal scripts must not run login profiles (which can be slow, interactive,
+// or alter stdout). Unset BASH_ENV before starting Bash, not inside the script.
+// Keep WSL_INTEROP and the rest of WSL's environment for Windows executables.
+func bashArgs(script string) []string {
+	return []string{
+		"/usr/bin/env", "-u", "BASH_ENV",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"/bin/bash", "--noprofile", "--norc", "-c", script,
+	}
 }
 
 func (client Client) ListDistros(ctx context.Context, runningOnly bool) ([]string, error) {

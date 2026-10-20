@@ -51,6 +51,7 @@ func TestDisabledStartProfiler(t *testing.T) {
 		t.Fatal("nil output should disable profiling")
 	}
 	profiler.mark("ignored")
+	profiler.skipped("ignored")
 	profiler.shell("ignored", "")
 	profiler.finish()
 	if got := shellTimingPreamble(false); got != "timing_mark() { :; }" {

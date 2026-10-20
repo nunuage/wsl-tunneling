@@ -347,13 +347,24 @@ func (a *app) runOperation(name string, completed string, operation func(context
 		return
 	}
 	a.setBusy(name)
+	var diagnostic *startDiagnostic
+	if name == "start" {
+		manager := a.currentManager()
+		diagnostic = newStartDiagnostic(manager.Config)
+		if diagnostic != nil {
+			operation = func(ctx context.Context) error {
+				manager := a.currentManager()
+				diagnostic.cfg = manager.Config
+				return manager.StartWithTimings(ctx, &diagnostic.phases)
+			}
+		}
+	}
 	go func() {
-		started := time.Now()
-		err := operation(a.ctx)
-		elapsed := time.Since(started)
+		elapsed, err := measureOperation(a.ctx, operation)
 		a.busy.Store(false)
 		a.queueNotification(operationNotification(name, completed, elapsed, err))
 		a.scheduleRefresh()
+		_ = diagnostic.write(elapsed, err)
 	}()
 }
 
